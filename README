@@ -50,15 +50,17 @@ cross-init-bridge:
   If the daemon uses systemd's sd_notify for readiness notification,
   use
      expect stop
-     exec /.../cross-init-bridge -t upstart -N -- /.../daemon
+     exec /.../cross-init-bridge -t systemd -N -- /.../daemon
 
   Sockets will be translated if passed from the init system
   (autodetected).
 
   Notifications are not autodetected, since the upstart notification
-  type is really invasive in the sense that getting it wrong will lead
-  to the daemon not starting at all. Therefore the system administrator
-  should be responsible for explicitly requesting support for that.
+  type changes process semantics quite a bit so that startup is
+  completely broken if the init system (and by extension, this bridge)
+  and the daemon don't agree on the notification scheme. Therefore the
+  system administrator / packager should be responsible for explicitly
+  requesting support for that.
 
   ::: Tested on:
 
@@ -72,22 +74,44 @@ cross-init-bridge:
   systemd allows for arbitrary messages to be passed over the
   notification interface. It also is not restricted to daemon startup.
   For this reason, a babysitter process is kept alive for the lifetime
-  of the daemon to provide the socket (even though all data is going to
-  be ignored), since somebody later opening a socket with the same name
-  but never reading packets from it could be a DOS attack, if the
-  daemon uses blocking writes for the notification and the socket
-  buffer is full. An option --end-after-ready is provided to end the
-  babysitter after the first readiness notification if one knows that
-  the daemon doesn't use the protocol more than once.
+  of the daemon to provide the socket. Only the first notification with
+  READY=1 is going to be relevant, all other data coming through this
+  socket is currently ignored - but is actually read from the socket so
+  that the kernel buffer doesn't fill up.
+
+  There is an option to end the babysitter process early, by specifying
+  --end-after-ready on the command line. If the daemon does not use the
+  notification socket again after it has sent READY=1 over the socket,
+  this is fine. But if the daemon actually does use the notification
+  socket after signaling readiness, the babysitter should continue to
+  run, providing the socket as a black hole, for two reasons:
+
+    - The daemon might not be able to properly cope with the socket
+      gone all of a sudden (this does not happen in the systemd case, 
+      because the socket will be there for the entire lifetime of the
+      system).
+
+    - If some other process re-creates the socket afterwards and the
+      daemon tries to access that socket again, the other process will
+      get all the notification data. If the socket is initially created
+      under /run, this is not too big of a problem, since usually only
+      privileged processes allowed to do so, but if the user verb is
+      used in the upstart job file, /run may actually not be writable
+      for the bridge and the socket may be created in /tmp. After the
+      babysitter exits, the socket could in principle be recreated by
+      an attacker, leading to two possbile kinds of attacks:
+      information disclosure (which might or might not be an issue) and
+      possibly denial of service for the daemon if the attacker simply
+      creates the socket but never reads from it, the daemon might just
+      block on the socket while notifying.
 
   Also note that each instance of a systemd daemon with notifications
   on top of upstart will have it's own socket (in contrast to systemd
   itself, which uses a single global socket), since this was the
-  easiest design. Also note that at least /tmp has to be writable,
-  otherwise the bridge will not work, because it doesn't have anywhere
-  to create the socket. (By default, it first tries to create it under
-  /run, but has /tmp as a fallback, since /run is usually only writable
-  for root.)
+  easiest design. At least /tmp has to be writable, otherwise the
+  bridge will not work, because it doesn't have anywhere to create the
+  socket. (By default, it first tries to create it under /run, but has
+  /tmp as a fallback, since /run is usually only writable for root.)
 
   ::: Bugs:
 
@@ -105,30 +129,50 @@ cross-init-bridge:
   ::: WONTFIX/CANTFIX:
 
   1. When running systemd-type notification daemon on top of upstart,
-  all messages through the notification interface will be ignored. One
-  possible thing that the daemon may specify is a new MAINPID, so that
-  systemd now supervises a different process. This is something this
-  tool actually makes use of if used in the other way (upstart-type
-  daemon on top of systemd). Unfortunately, since upstart doesn't seem
-  to support an external program telling it that the main process id
-  of a service has changed, this will probably never work.
+  all messages through the notification interface will be ignored,
+  except for the initial READY=1 signal. This is usually harmless
+  (although some information the administrator is interested in might
+  get lost, so one could think about sending it to syslog(3) instead of
+  eating it), but systemd allows for one important message to be sent
+  via the socket that can't be properly handled: if the process
+  specifies that it has changed its main process id via the MAINPID=
+  message. Upstart doesn't appear to have a mechanism to notify it of
+  such things, so it is doubtful this can ever be supported. (And if
+  one actually implements a mechanism in upstart for this, the ĺogical
+  thing would be to use systemd's notification protocol for this
+  instead of inventing yet another thing, making this bridge obsolete.)
 
-  2. Upstart only supports one socket for activation and only AF_INET
-  and AF_LOCK type sockets. AF_INET6 is not supported, for example. For
-  this reason, translating socket activation will only work for one
-  socket of one of those types. An error will be specified otherwise.
+  Ironically, this bridge uses systemd's MAINPID= support for precisely
+  this when emulating upstart's protocol for systemd.
+
+  2. Upstart only supports one socket at a time for activation. Also,
+  only AF_INET (IPv4) and AF_LOCAL (UNIX domain / abstract) sockets are
+  supported. For example, AF_INET6 (IPv6) is not supported.
+  Additionally, it can only create SOCK_STREAM sockets (in IPv4 that
+  means only TCP, no UDP). The bridge will check that all sockets it
+  receives from systemd are SOCK_STREAM of type AF_INET and/or
+  AF_LOCAL. If that is not the case (or the FD is a FIFO, which systemd
+  supports but Upstart doesn't), this bridge is conservative and
+  will refuse to start the daemon. (It also only allows one socket in
+  total.)
 
   3. Upstart only passes the socket when activated via the socket,
-  whereas systemd always passes the socket, regardless of the way the
+  the socket is not passed when started manually or because of another
+  event. systemd always passes the socket, regardless of the way the
   program was started. This could lead to problems in both directions:
 
   3a. If the service was started manually or due to some other reason
   that was not an activation event on a the socket, the socket will not
-  be passed to the daemon. Furthermore, the daemon might try to listen
-  manually on the same port itself (since it didn't get a socket from
-  upstart), but that will fail because it's already in use. This is a
-  general problem with upstart, irrespective of this bridge, so unless
-  this is fixed in upstart, nothing can be done about it.
+  be passed to the daemon. This might not seem problematic, but if no
+  socket is passed, for a daemon to be useful it would have to create
+  the socket itself, which it can't, because upstart already holds it.
+  This is not specifically tied to this bridge, and appears to be a
+  severe limitation in upstart's socket activation design, and unless
+  this is fixed, this bridge cannot do anything about it.
+
+  (Solving this problem would also probably also make it trivial to
+  implement multiple sockets in upstart, but it is unclear as to how
+  easy making the required changes will be.)
 
   3b. An upstart service might expect that if a socket has been passed,
   that it will always have a client on the other end of the socket. If
@@ -136,11 +180,13 @@ cross-init-bridge:
   socket, but no client on the other end of it. A well-written daemon
   should cope with this regardless (since spurious select/poll/epoll
   events can happen anyway), but some daemons might not work properly
-  because of this. In the opinion of the author of the softare, these
-  should be considered bugs in the respective daemons.
+  because of this. In the opinion of the author of the bridge this type
+  of behaviour should be considered a bug in the respective daemon,
+  because it could already occur with upstart on a spurious polling
+  event.
 
 TODO:
 
  - proper build system
- - wait for dbus name (for systemd Type=bus services on upstart)
+ - wait for dbus name (for systemd Type=dbus services on upstart)
 
