@@ -441,12 +441,105 @@ done_notify:
 
 int setup_sigstop_waiter(char *notify_socket)
 {
-  pid_t child_pid, pid;
+  pid_t child_pid, pid, first_child_pid;
   int status;
   int s;
+  int r;
   struct sockaddr_un addr;
   ssize_t sent;
+  int pipes[2];
   char buf[256];
+
+  /* create intermediate child first */
+  r = pipe(pipes);
+  if (r < 0) {
+    fprintf(stderr, "[systemd -> upstart bridge] could not create pipes for IPC: %s\n", strerror(errno));
+    return -1;
+  }
+
+  first_child_pid = fork();
+  if (first_child_pid < 0) {
+    fprintf(stderr, "[systemd -> upstart bridge] could not fork intermediate child: %s\n", strerror(errno));
+    close(pipes[0]);
+    close(pipes[1]);
+    return -1;
+  }
+
+  /* parent process */
+  if (first_child_pid > 0) {
+    close(pipes[1]);
+  retry_read:
+    r = read(pipes[0], &child_pid, sizeof(pid_t));
+    if (r < 0 && errno == EINTR)
+      goto retry_read;
+    /* always reap the process */
+
+  retry_waitpid:
+    pid = waitpid(first_child_pid, &status, 0);
+    if (pid < 0) {
+      if (errno == EINTR)
+        goto retry_waitpid;
+      fprintf(stderr, "[systemd -> upstart bridge] waitpid error: %s\n", strerror(errno));
+      return -1;
+    }
+
+    /* child has exited for some reason, so pass on the result */
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+      exit(WEXITSTATUS(status));
+    /* child received some signal, pass that on */
+    if (WIFSIGNALED(status)) {
+      if (WTERMSIG(status) != SIGSTOP)
+        raise(WTERMSIG(status));
+      raise(SIGTERM);
+      exit(1);
+    }
+
+    /* we didn't properly get the pid... that shouldn't happen,
+     * but we can't do anything about it */
+    if (r != sizeof(pid_t)) {
+      fprintf(stderr, "[systemd -> upstart bridge] internal IPC error (status = %d, rcvd pid size = %d)\n", status, r);
+      return -1;
+    }
+
+    /* since our child has ended, this means that the grandchild is ready
+     * (and now also a child of init!), so we do the signaling, and also
+     * send SIGCONT to the grandchild */
+    s = socket(AF_LOCAL, SOCK_DGRAM, 0);
+    if (s < 0)
+      goto kill_child_if_internal_error;
+
+    snprintf(buf, sizeof(buf), "READY=1\nMAINPID=%lu", (unsigned long) child_pid);
+
+    addr.sun_family = AF_LOCAL;
+    snprintf(addr.sun_path, UNIX_MAX_PATH, "%s", notify_socket);
+    if (notify_socket[0] == '@')
+      addr.sun_path[0] = '\0';
+
+  retry_signal:
+    sent = sendto(s, buf, strlen(buf), MSG_NOSIGNAL, (struct sockaddr *)&addr, sizeof(sa_family_t) + strlen(notify_socket));
+    if (sent < 0) {
+      if (errno == -EINTR)
+        goto retry_signal;
+      fprintf(stderr, "[systemd -> upstart bridge] could not send readiness signal to systemd: %s\n", strerror(errno));
+      close(s);
+      goto kill_child_if_internal_error;
+    }
+    close(s);
+
+    /* now that systemd knows that the service is running, send SIGCONT, so that 
+    * it may continue */
+    kill(child_pid, SIGCONT);
+
+    /* just for good measure, wait a bit before we terminate, just in case
+    * events aren't ordered properly */
+    sleep(1);
+
+    exit(0);
+    return 0; /* to keep compiler happy */
+  }
+
+  /* close pipe */
+  close(pipes[0]);
 
   /* create a child process that we'll wait on */
   child_pid = fork();
@@ -454,10 +547,23 @@ int setup_sigstop_waiter(char *notify_socket)
     return -1;
 
   if (child_pid == 0) {
+    /* close other pipe, we only need it in intermediate process */
+    close(pipes[1]);
     /* we are the child, which will execute the daemon itself, so return
      * to the caller */
     return 0;
   }
+
+retry_write_pid:
+  /* send child pid to process communicating with systemd
+   * (because systemd expects the main process to use the notification,
+   * other processes are disallowed) */
+  r = write(pipes[1], &child_pid, sizeof(pid_t));
+  if (r < 0 && errno == EINTR)
+    goto retry_write_pid;
+  if (r != sizeof(pid_t))
+    goto kill_child_if_internal_error;
+  close(pipes[1]);
 
   /* we are now the parent, so we will wait for the child either
    * dying (failure) or raising SIGSTOP, which will then cause us
@@ -469,8 +575,7 @@ retry:
       goto retry;
     /* oh, this is really weird, this shouldn't happen...
      * oh well, kill the child and exit ourselves */
-    kill(child_pid, SIGTERM);
-    exit(1);
+    goto kill_child_if_internal_error;
   }
 
   /* child is now either in stopped state (upstart notification protocol)
@@ -491,45 +596,16 @@ retry:
   if (!WIFSTOPPED(status))
     goto kill_child_if_internal_error;
 
-  /* child is now stopped, so they are signaling us that they
-   * are finished with initialization, so go on to signal systemd */
-  s = socket(AF_LOCAL, SOCK_DGRAM, 0);
-  if (s < 0)
-    goto kill_child_if_internal_error;
-
-  snprintf(buf, sizeof(buf), "READY=1\nMAINPID=%lu", (unsigned long) child_pid);
-
-  addr.sun_family = AF_LOCAL;
-  snprintf(addr.sun_path, UNIX_MAX_PATH, "%s", notify_socket);
-  if (notify_socket[0] == '@')
-    addr.sun_path[0] = '\0';
-
-retry_signal:
-  sent = sendto(s, buf, strlen(buf), MSG_NOSIGNAL, (struct sockaddr *)&addr, sizeof(sa_family_t) + strlen(notify_socket));
-  if (sent < 0) {
-    if (errno == -EINTR)
-      goto retry_signal;
-    fprintf(stderr, "[systemd -> upstart bridge] could not send readiness signal to systemd: %s\n", strerror(errno));
-    close(s);
-    goto kill_child_if_internal_error;
-  }
-  close(s);
-
-  /* now that systemd knows that the service is running, send SIGCONT, so that 
-   * it may continue */
-  kill(child_pid, SIGCONT);
-
-  /* just for good measure, wait a bit before we terminate, just in case
-   * events aren't ordered properly */
-  sleep(1);
-
+  /* we are the intermediate child; the daemon itself, which is our child,
+   * is now stopped and we have sent the child's pid to our parent.
+   * Once we exit, our child gets reparented to init and our parent
+   * will tell init what the new main process id is. */
   exit(0);
-  return 0; /* to keep compiler happy */
-  
+
 kill_child_if_internal_error:
   /* we hope this doesn't happen at all, but just to be safe,
-   * we have to get rid of the child if something in our code
-   * fails... */
+  * we have to get rid of the child if something in our code
+  * fails... */
   kill(child_pid, SIGTERM);
   kill(child_pid, SIGCONT);
   exit(1);

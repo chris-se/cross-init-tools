@@ -29,6 +29,10 @@ cross-init-bridge:
     gcc -Wall -o cross-init-bridge cross-init-bridge.c \
         -I/usr/include/dbus-1.0 -I/usr/lib/dbus-1.0/include \
         -ldbus-1
+    Under Fedora 20, use:
+    gcc -Wall -o cross-init-bridge cross-init-bridge.c \
+        -I/usr/include/dbus-1.0 -I/usr/lib64/dbus-1.0/include \
+        -ldbus-1
 
   ::: Usage:
 
@@ -60,6 +64,8 @@ cross-init-bridge:
 
   Kubuntu 13.10 (Saucy Salamander) for Upstart (Upstart 1.10)
   Fedora 19 (Schrödinger's Cat) for systemd (systemd 204)
+      (WARNING for systemd 204: see unter "Bugs")
+  Fedora 20 (Heisenbug) for systemd (systemd 208)
 
   ::: Peculiarities:
 
@@ -86,23 +92,15 @@ cross-init-bridge:
   ::: Bugs:
 
   1. When running an upstart daemon on top of systemd with readiness
-  notification, this does work, but systemd will print a warning
-  to the journal:
-    systemd[1]: XXX.service: Supervising process YYY which is not our
-                child. We'll most likely not notice when it exits.
-  This is because at the time of the notification, the process
-  notifying systemd (that also sends MAINPID=...) is still the parent
-  of the process. (It has to be to intercept SIGSTOP...) It does exit
-  immediately after that, so systemd (pid 1) does become the parent of
-  the process it's supervising, but some internal status remains a bit
-  off, so that when the process dies unexpectedly, systemd will record
-  that, but will not put the service into a failed state internally.
+  notification, this doesn't work in systemd 204, at least the one
+  that's shipped with Fedora 19. With systemd 208 everything works
+  properly. In systemd 204, it kind of breaks the internal state of
+  systemd, so that it doesn't detect that the process is gone.
 
-  Could probably be worked around by adding an additional process in
-  between that waits for SIGSTOP, then signals the parent, exits (such
-  that the real daemon is now child of pid1), then the original signals
-  systemd with the new MAINPID and exits itself. Not done yet, but
-  should be feasible.
+  A previous version in git was somewhat better for earlier versions
+  of systemd (internal state not totally broken, but no proper
+  detection of service failure either), but will cause warning messages
+  to be generated.
 
   ::: WONTFIX/CANTFIX:
 
@@ -146,6 +144,5 @@ TODO:
  - proper build system
  - check that socket type is SOCK_STREAM (upstart supports nothing else
    at the moment), and fail if otherwise
- - fix bugs #1 and #2 (see above)
  - wait for dbus name (for systemd Type=bus services on upstart)
 
