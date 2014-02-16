@@ -314,7 +314,7 @@ int bridge_systemd_to_upstart(int notify, char *unit, char **argv)
   char buf[4096];
   struct sockaddr_storage ss;
   socklen_t socklen;
-  int r;
+  int r, type = -1;
 
   if (p_)
     p_ = strdup(p_);
@@ -384,6 +384,18 @@ int bridge_systemd_to_upstart(int notify, char *unit, char **argv)
    *        But for now, stick to the specs. */
   if (ss.ss_family != AF_INET && ss.ss_family != AF_LOCAL) {
     fprintf(stderr, "[systemd -> upstart bridge] socket passed from systemd is not IPv4 or UNIX, but upstart protocol doesn't support anything else.\n");
+    return 1;
+  }
+
+  /* check if socket type is stream, upstart doesn't support datagram or anything else */
+  socklen = sizeof(type);
+  r = getsockopt(SD_LISTEN_FDS_START, SOL_SOCKET, SO_TYPE, &type, &socklen);
+  if (r < 0) {
+    fprintf(stderr, "[systemd -> upstart bridge] getsockopt(SO_TYPE) failed: %s.\n", strerror(errno));
+    return 1;
+  }
+  if (type != SOCK_STREAM) {
+    fprintf(stderr, "[systemd -> upstart bridge] socket passed from systemd is not a SOCK_STREAM socket, but upstart protocol doesn't support anything else.\n");
     return 1;
   }
 

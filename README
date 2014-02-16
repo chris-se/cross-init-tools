@@ -142,7 +142,5 @@ cross-init-bridge:
 TODO:
 
  - proper build system
- - check that socket type is SOCK_STREAM (upstart supports nothing else
-   at the moment), and fail if otherwise
  - wait for dbus name (for systemd Type=bus services on upstart)
 
