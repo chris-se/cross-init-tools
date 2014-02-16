@@ -1,0 +1,161 @@
+cross-init-tools: Improve compatibility between init systems
+
+Status: experimental. It should work, but a review is required. Since
+this code might be executed with privileges, a proper review should
+look at security aspects, which hasn't been done so far. (Somebody
+definitely needs to review the mkdtemp part, if that is really correct
+in the way it's used.)
+
+Prerequisits: dbus-1 library (the low-level one)
+
+cross-init-bridge:
+
+  Maps between upstart and systemd types of readiness notifications
+  and socket activation. It automatically detects the init system it
+  is run on. An option named --target specifies which init system the
+  daemon was designed for (upstart, systemd) and the program translates
+  between that and the init system currently in use (it is essentially
+  a NOOP if both are the same).
+
+  ::: Compile:
+    gcc -Wall -o cross-init-bridge cross-init-bridge.c \
+       -I$DBUS_INCLUDE_PATH -L$DBUS_LIBRARY_PATH -ldbus-1
+    For example, under x86_64 Kubuntu Saucy Salamander, use:
+    gcc -Wall -o cross-init-bridge cross-init-bridge.c \
+        -I/usr/include/dbus-1.0 \
+        -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include \
+        -ldbus-1
+    Under Fedora 19, use:
+    gcc -Wall -o cross-init-bridge cross-init-bridge.c \
+        -I/usr/include/dbus-1.0 -I/usr/lib/dbus-1.0/include \
+        -ldbus-1
+
+  ::: Usage:
+
+  For using a daemon that was designed for upstart from a systemd
+  unit file, use:
+     ExecStart=/.../cross-init-bridge -t upstart -- /.../daemon
+  If the daemon uses raise(SIGSTOP) to notify upstart of its readiness,
+  use
+     Type=notify
+     ExecStart=/.../cross-init-bridge -t upstart -N -- /.../daemon
+
+  For using a daemon that was designed for systemd from an upstart
+  job file, use:
+     exec /.../cross-init-bridge -t systemd -- /.../daemon
+  If the daemon uses systemd's sd_notify for readiness notification,
+  use
+     expect stop
+     exec /.../cross-init-bridge -t upstart -N -- /.../daemon
+
+  Sockets will be translated if passed from the init system
+  (autodetected).
+
+  Notifications are not autodetected, since the upstart notification
+  type is really invasive in the sense that getting it wrong will lead
+  to the daemon not starting at all. Therefore the system administrator
+  should be responsible for explicitly requesting support for that.
+
+  ::: Tested on:
+
+  Kubuntu 13.10 (Saucy Salamander) for Upstart (Upstart 1.10)
+  Fedora 19 (Schrödinger's Cat) for systemd (systemd 204)
+
+  ::: Peculiarities:
+
+  systemd allows for arbitrary messages to be passed over the
+  notification interface. It also is not restricted to daemon startup.
+  For this reason, a babysitter process is kept alive for the lifetime
+  of the daemon to provide the socket (even though all data is going to
+  be ignored), since somebody later opening a socket with the same name
+  but never reading packets from it could be a DOS attack, if the
+  daemon uses blocking writes for the notification and the socket
+  buffer is full. An option --end-after-ready is provided to end the
+  babysitter after the first readiness notification if one knows that
+  the daemon doesn't use the protocol more than once.
+
+  Also note that each instance of a systemd daemon with notifications
+  on top of upstart will have it's own socket (in contrast to systemd
+  itself, which uses a single global socket), since this was the
+  easiest design. Also note that at least /tmp has to be writable,
+  otherwise the bridge will not work, because it doesn't have anywhere
+  to create the socket. (By default, it first tries to create it under
+  /run, but has /tmp as a fallback, since /run is usually only writable
+  for root.)
+
+  ::: Bugs:
+
+  1. When running an upstart daemon on top of systemd with readiness
+  notification, this does work, but systemd will print a warning
+  to the journal:
+    systemd[1]: XXX.service: Supervising process YYY which is not our
+                child. We'll most likely not notice when it exits.
+  This is because at the time of the notification, the process
+  notifying systemd (that also sends MAINPID=...) is still the parent
+  of the process. (It has to be to intercept SIGSTOP...) It does exit
+  immediately after that, so systemd (pid 1) does become the parent of
+  the process it's supervising, but some internal status remains a bit
+  off, so that when the process dies unexpectedly, systemd will record
+  that, but will not put the service into a failed state internally.
+
+  Could probably be worked around by adding an additional process in
+  between that waits for SIGSTOP, then signals the parent, exits (such
+  that the real daemon is now child of pid1), then the original signals
+  systemd with the new MAINPID and exits itself. Not done yet, but
+  should be feasible.
+
+  2. When using --end-after-ready for systemd daemons on upstart, even
+  though the process exits, a zombie might remain if the daemon doesn't
+  reap its children. Even worse, if the daemon reacts allergically to
+  SIGCHLD, this may kill the daemon.
+
+  Solution would be to double-fork() if --end-after-ready is used (then
+  PDEATHSIG is not necessary anyway) and end the intermediate process
+  before exec()ing the daemon itself. In that case, the granchild is
+  now child of init and will be properly reaped.
+
+  ::: WONTFIX/CANTFIX:
+
+  1. When running systemd-type notification daemon on top of upstart,
+  all messages through the notification interface will be ignored. One
+  possible thing that the daemon may specify is a new MAINPID, so that
+  systemd now supervises a different process. This is something this
+  tool actually makes use of if used in the other way (upstart-type
+  daemon on top of systemd). Unfortunately, since upstart doesn't seem
+  to support an external program telling it that the main process id
+  of a service has changed, this will probably never work.
+
+  2. Upstart only supports one socket for activation and only AF_INET
+  and AF_LOCK type sockets. AF_INET6 is not supported, for example. For
+  this reason, translating socket activation will only work for one
+  socket of one of those types. An error will be specified otherwise.
+
+  3. Upstart only passes the socket when activated via the socket,
+  whereas systemd always passes the socket, regardless of the way the
+  program was started. This could lead to problems in both directions:
+
+  3a. If the service was started manually or due to some other reason
+  that was not an activation event on a the socket, the socket will not
+  be passed to the daemon. Furthermore, the daemon might try to listen
+  manually on the same port itself (since it didn't get a socket from
+  upstart), but that will fail because it's already in use. This is a
+  general problem with upstart, irrespective of this bridge, so unless
+  this is fixed in upstart, nothing can be done about it.
+
+  3b. An upstart service might expect that if a socket has been passed,
+  that it will always have a client on the other end of the socket. If
+  started in a systemd environment, a manual start will still pass the
+  socket, but no client on the other end of it. A well-written daemon
+  should cope with this regardless (since spurious select/poll/epoll
+  events can happen anyway), but some daemons might not work properly
+  because of this. In the opinion of the author of the softare, these
+  should be considered bugs in the respective daemons.
+
+TODO:
+
+ - proper build system
+ - check that socket type is SOCK_STREAM (upstart supports nothing else
+   at the moment), and fail if otherwise
+ - fix bugs #1 and #2 (see above)
+ - wait for dbus name (for systemd Type=bus services on upstart)
+
