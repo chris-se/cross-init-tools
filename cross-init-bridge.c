@@ -632,6 +632,7 @@ int setup_sd_notify_waiter(int end_after_ready)
 {
   pid_t waiter_pid;
   pid_t orig_pid;
+  pid_t pid;
   int s;
   int r;
   int exit_status = 0;
@@ -726,6 +727,20 @@ int setup_sd_notify_waiter(int end_after_ready)
    * might immediately die, but the child still has all signals blocked
    * and will install appropriate handlers to make sure cleanup happens. */
   if (waiter_pid > 0) {
+    /* if end_after_ready is set, reap the child, because
+     * we double-fork and don't use PDEATHSIG */
+    if (end_after_ready) {
+    retry_orig_wait:
+      pid = waitpid(waiter_pid, &exit_status, 0);
+      if (pid < 0) {
+        if (errno == EINTR)
+          goto retry_orig_wait;
+        fprintf(stderr, "[upstart -> systemd bridge] waitpid failed: %s\n", strerror(errno));
+        /* should not happen */
+        return -1;
+      }
+    }
+
     close(s);
     r = sigprocmask(SIG_SETMASK, &origmask, NULL);
     /* should NOT happen, but just in case, don't start the daemon,
@@ -733,6 +748,19 @@ int setup_sd_notify_waiter(int end_after_ready)
     if (r < 0)
       return -1;
     return 0;
+  }
+
+  if (end_after_ready) {
+    /* double-fork, so the waiter process is child of init and can
+     * be reaped immediately */
+    waiter_pid = fork();
+    if (waiter_pid < 0) {
+      fprintf(stderr, "[upstart -> systemd bridge] double-fork failed: %s\n", strerror(errno));
+      goto error_cleanup;
+    }
+
+    if (waiter_pid > 0)
+      exit(0);
   }
 
   /* just in case we were passed a socket, don't keep it in the babysitting
@@ -744,10 +772,11 @@ int setup_sd_notify_waiter(int end_after_ready)
   setup_sighandlers();
   
   /* child process: try to set PDEATHSIG (but don't fail if it doesn't work) */
-  prctl(PR_SET_PDEATHSIG, SIGTERM);
+  if (!end_after_ready)
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
 
   /* if parent already died in the mean time... */
-  if (getppid() != orig_pid)
+  if ((!end_after_ready && getppid() != orig_pid) || (end_after_ready && kill(orig_pid, 0) < 0))
     goto error_cleanup;
   
   /* close standard fds, to make sure we don't keep something open the daemon
@@ -784,7 +813,7 @@ int setup_sd_notify_waiter(int end_after_ready)
      * privileged one. The timeout of 60s will ensure that we will not
      * stay around for too long in that case, but also that we don't poll
      * constantly and use up resources. */
-    if (getppid() != orig_pid) {
+    if ((!end_after_ready && getppid() != orig_pid) || (end_after_ready && kill(orig_pid, 0) < 0)) {
       if (!notified)
         exit_status = 1;
       goto cleanup;

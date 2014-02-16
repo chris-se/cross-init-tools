@@ -104,16 +104,6 @@ cross-init-bridge:
   systemd with the new MAINPID and exits itself. Not done yet, but
   should be feasible.
 
-  2. When using --end-after-ready for systemd daemons on upstart, even
-  though the process exits, a zombie might remain if the daemon doesn't
-  reap its children. Even worse, if the daemon reacts allergically to
-  SIGCHLD, this may kill the daemon.
-
-  Solution would be to double-fork() if --end-after-ready is used (then
-  PDEATHSIG is not necessary anyway) and end the intermediate process
-  before exec()ing the daemon itself. In that case, the granchild is
-  now child of init and will be properly reaped.
-
   ::: WONTFIX/CANTFIX:
 
   1. When running systemd-type notification daemon on top of upstart,
